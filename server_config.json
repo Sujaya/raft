@@ -1,0 +1,11 @@
+{
+	"datacenters": {
+		"dc1": ["127.0.0.1", 5001],
+		"dc2": ["127.0.0.1", 5002]
+	},
+
+	"tickets": 5,
+
+	"election_timeout":[4,8],
+	"heartbeat_timeout":0.5
+}
