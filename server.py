@@ -12,6 +12,7 @@ import random
 REQVOTE = 'RequestVote'
 RESVOTE = 'ResponseVote'
 APPENDENTRIES = 'AppendEntries'
+RESENTRIES = 'ResponseEntries'
 CLIREQ = 'CLIREQ'
 
 STATES = {1: 'FOLLOWER', 2: 'CANDIDATE', 3: 'LEADER'}
@@ -26,10 +27,15 @@ class RaftServer():
         self.electionTimer = None
         self.heartbeatTimer = None
         self.voteCount = 0
-        self.votedFor = None
+        self.votedFor = {}
         self.followers = {}
-        self.commitIdx = -1
-        self.logEntries = ['1','2']
+        self.commitIdx = 0 #-1
+        if dcId == 'dc1':
+            self.logEntries = [[0, 1, 1],[1, 1, 1], [2, 3, 1]]
+            self.newEntries = {1:1, 2:1}
+        else:
+            self.logEntries = [[0, 1, 1],[1, 2, 1], [2, 2, 1], [3, 2, 1], [4, 2, 1]]
+            self.newEntries = {}
         self.readAndApplyConfig()
         self.initParam()
         self.resetElectionTimer()
@@ -39,16 +45,18 @@ class RaftServer():
     def initParam(self):
         '''Read from log file and update in memory variables based on last log entry'''
         #Optimize
-        with open(str(dcId)+'.log') as log_file:    
-            log = list(log_file)[-1] if list(log_file) else None
+        with open(str(dcId)+'.log') as log_file:
+            log_list= list(log_file)
+            log = log_list[-1] if len(log_list)>0 else None
 
         if not log:
-            parts = [0, 0, None]
+            parts = [-1, 0, None]
         else: 
-            parts = log.split(' ')
-        self.lastLogTerm = parts[0]
-        self.lastLogIdx = parts[1]
+            parts = log.split(',')
+        self.lastLogIdx = int(parts[0])
+        self.lastLogTerm = int(parts[1])
         self.lastCommand = parts[2]
+        self.term = int(parts[1])
 
 
     def readAndApplyConfig(self):
@@ -102,11 +110,11 @@ class RaftServer():
 
     def formAppendEntriesMsg(self, nextIdx):
         msg = {
-            'AppendEntries' : {
+        'AppendEntries' : {
             'term': self.term,
             'leaderId': self.dcId,
-            'prevLogIdx': self.lastLogIdx,
-            'prevLogTerm': self.lastLogIdx,
+            'prevLogIdx': self.logEntries[nextIdx-1][0] if nextIdx>0 else -1,
+            'prevLogTerm': self.logEntries[nextIdx-1][1] if nextIdx>0 else 0,
             'entries': self.getLogEntries(nextIdx),
             'commitIdx': self.commitIdx
             }
@@ -114,28 +122,44 @@ class RaftServer():
         return msg
 
 
+    def formResponseEntriesMsg(self, success=False):
+        msg = { 
+        'ResponseEntries': {
+            'term': self.term,
+            'followerId':self.dcId,
+            'lastLogIdx':self.lastLogIdx,
+            'success': success
+            }
+        }
+        return msg
+
+
+    def getLogEntries(self, nextIdx):
+        '''Send everything from nextIdx to lastIdx; if they are equal, send empty list for heartbeat'''
+        return self.logEntries[nextIdx:]
+
     ############################# Leader election methods#############################
 
     def resetElectionTimer(self):
         '''Start a timer; when it goes off start the election'''
         if self.electionTimer:
-            print 'Canceling timer thread id %s' %(self.electionTimer)
             self.electionTimer.cancel()
         timeout = random.uniform(self.election_timeout[0], self.election_timeout[1])
         self.logger.debug('Resetting timer to value %.2f' %timeout)
 
-        if self.dcId == 'dc1': delay = 5
-        else: delay = 15
-        self.electionTimer = threading.Timer(delay, self.startElection)
-        print 'Created timer thread id %s' %(self.electionTimer)
+        if self.dcId == 'dc1': timeout = 5
+        else: timeout=10
+        self.electionTimer = threading.Timer(timeout, self.startElection)
         self.electionTimer.start()
 
 
     def startElection(self):
-        if not self.state == STATES[2]:
+        '''If not already a leader, change to candidate, increment term and req vote'''
+        if not self.state == STATES[3]:
             self.state = STATES[2]
             self.term += 1
             self.requestVote()
+            self.votedFor[self.term] = self.dcId
 
 
     def requestVote(self):
@@ -153,19 +177,22 @@ class RaftServer():
         grantingVote = False
         ip, port = self.getServerIpPort(msg['candidateId'])
 
-        if msg['term'] >= self.term:
+        if msg['term'] > self.term:
             '''Update term if it is lesser than candidat'e term'''
             self.term = msg['term']
             self.convertToFollower()
 
-            if self.votedFor == None or self.votedFor == msg['candidateId']:
+        if msg['term'] >= self.term:
+            '''Check if log entries of candidate is good enough to be elected as leader'''
+            if (msg['term'] not in self.votedFor) or (self.votedFor[msg['term']] == msg['candidateId']):
                 if (msg['lastLogTerm'] > self.lastLogTerm or \
                     (msg['lastLogTerm'] == self.lastLogTerm and msg['lastLogIdx'] >= self.lastLogIdx)):
                     '''Candidate's log is at least as much as voter's log'''
                     respMsg = self.formResponseVoteMsg(voteGranted=True)
                     self.sendTcpMsg(ip, port, respMsg)
                     grantingVote = True
-                    self.resetElectionTimer()
+                    self.votedFor[msg['term']] = msg['candidateId']
+                    self.convertToFollower()
 
         if not grantingVote:
             '''If conditions for granting vote failed, respond with "no"'''
@@ -187,6 +214,7 @@ class RaftServer():
 
     def convertToLeader(self):
         self.logger.debug('Converting to leader.')
+        self.state = STATES[3]
         self.initFollowerDetails()
         self.resetHeartbeatTimer()
 
@@ -195,13 +223,10 @@ class RaftServer():
 
     def resetHeartbeatTimer(self):
         '''Start a timer; keep sending hearbeats after it goes off'''
-        self.heartbeatTimer = threading.Timer(self.heartbeat_timeout, self.sendAppendEntries)
+        if self.heartbeatTimer:
+            self.heartbeatTimer.cancel()
+        self.heartbeatTimer = threading.Timer(self.heartbeat_timeout, self.sendAppendEntriesToAll)
         self.heartbeatTimer.start()
-
-
-    def getLogEntries(self, nextIdx):
-        '''Send everything from nextIdx to lastIdx; if they are equal, send empty list for heartbeat'''
-        return self.logEntries[nextIdx:]
 
 
     def initFollowerDetails(self):
@@ -209,21 +234,114 @@ class RaftServer():
         for dcId in self.config['datacenters']:
             if dcId == self.dcId:
                 continue
-            self.followers[dcId] = self.lastLogIdx + 1 
+            '''lastLogIdx is updated as soon as client req arrives; initialize
+            nextIdx to the latest entry in log.'''
+            self.followers[dcId] = self.lastLogIdx
 
 
-    def sendAppendEntries(self):
+    def sendAppendEntriesToAll(self):
         for dcId in self.followers:
-            msg = self.formAppendEntriesMsg(self.followers[dcId])
-            ip, port = self.getServerIpPort(dcId)
-            self.sendTcpMsg(ip, port, msg)
+            self.sendAppendEntriesMsg(dcId)
+        self.resetHeartbeatTimer()
+
+
+    def sendAppendEntriesMsg(self, dcId):
+        msg = self.formAppendEntriesMsg(self.followers[dcId])
+        ip, port = self.getServerIpPort(dcId)
+        self.sendTcpMsg(ip, port, msg)
+
+
+    def handleResponseEntries(self, msg):
+        if msg['term'] > self.term:
+            '''There is new leader; step down'''
+            self.convertToFollower()
+        else:
+            if msg['success'] == True:
+                self.updateReplicationCount(msg)
+            else:
+                self.retryAppendEntries(msg)
+
+
+    def retryAppendEntries(self, msg):
+        '''Consistency check has failed for this follower.
+        Decrement it's nextIdx and retry appendEntries RPC'''
+        followerId = msg['followerId']
+        self.followers[followerId] -= 1
+        self.sendAppendEntriesMsg(followerId)
+
+
+    def updateReplicationCount(self, msg):
+        followerId = msg['followerId']
+        nextIdx = self.followers[followerId]
+        print 'nextidx %d' %nextIdx
+        '''Starting from nextIdx of the follower who responded till its lastIdx, updated 
+        replicated count of new entries that hasn't gotten majority yet'''
+        while nextIdx <= msg['lastLogIdx']:
+            if nextIdx in self.newEntries:
+                self.newEntries[nextIdx] += 1
+                if self.newEntries[nextIdx] >= self.majority:
+                    self.updateCommitIdx(nextIdx)
+            nextIdx += 1
+
+        self.followers[followerId] = nextIdx   
+
+
+    def updateCommitIdx(self, nextIdx):
+        '''Get the term for the entry that just got majority'''
+        logTerm = self.logEntries[nextIdx][1]
+
+        '''If the term of the entry is same as current leader's term, then mark all 
+        entries till that entry as committed'''
+        if logTerm == self.term:
+            while self.commitIdx < nextIdx:
+                self.commitIdx += 1
+                self.logger.debug('Updated commited index to %d' %self.commitIdx)
+                #TODO: update state m/c
+                self.newEntries.pop(self.commitIdx)
 
 
     ############################# Follower functionalities methods#############################
 
     def handleAppendEntries(self, msg):
         '''Reset election timer as leader is alive'''
-        self.resetElectionTimer()
+        success = False
+        self.commitIdx = max(self.commitIdx, msg['commitIdx'])
+        if self.term > msg['term']:
+            '''Invalid leader; just return failure RPC to update stale leader'''
+            success = False
+
+        else:
+            self.term = msg['term']
+            self.convertToFollower()
+
+            '''Perform consistency check on logs of follower and leader'''
+            #Verify***
+            if self.lastLogIdx < msg['prevLogIdx']:
+                '''Missing entries case: send failure so that leader decrements next index and retries'''
+                success = False
+
+            else:
+                if msg['prevLogIdx'] >= 0 and self.logEntries[msg['prevLogIdx']][1] != msg['prevLogTerm']:
+                    '''Inconsistent entries case: At prevLogIdx, follower's and leader's terms don't match.
+                    Send failure so that leader decrements next idx and retries'''
+                    success = False
+                else:
+                    '''Success case: Keep entries only till prevLogIdx, to that append the newly sent entries'''
+                    self.logEntries = self.logEntries[:msg['prevLogIdx']+1]
+                    self.logEntries.extend(msg['entries'])
+                    self.lastLogIdx = len(self.logEntries)-1
+                    self.lastLogTerm = self.logEntries[self.lastLogIdx][1]
+                    success = True
+
+                    if len(msg['entries']) > 0:
+                        self.logger.debug('Updated (lastLogIdx, lastLogTerm, logEntries) to (%d, %d, %s)' \
+                        %(self.lastLogIdx, self.lastLogTerm, repr(self.logEntries)))
+
+        if len(msg['entries']) > 0:
+            '''Respond only for msgs that are not heartbeats'''
+            respMsg = self.formResponseEntriesMsg(success=success)
+            ip, port = self.getServerIpPort(msg['leaderId'])
+            self.sendTcpMsg(ip, port, respMsg)
 
 
     ############################# Misc methods#############################
@@ -240,12 +358,19 @@ class RaftServer():
         self.logger.debug('Converting to follower.')
         self.state = STATES[1]
         self.voteCount = 0
+        self.followers = {}
+        self.newEntries = {}
+        self.resetElectionTimer()
 
 
     def getServerIpPort(self, dcId):
         '''Get ip and port on which server is listening from config'''
         return self.config['datacenters'][dcId][0], self.config['datacenters'][dcId][1]
 
+
+    def extractTermFromLog(self, logIdx):
+        '''Implement from log'''
+        return self.lastLogTerm
 
 
     # Multithreaded Python server : TCP Server Socket Thread Pool
@@ -276,9 +401,11 @@ class RaftServer():
                 self.raft.handleVoteReply(msg)
             elif msgType == APPENDENTRIES:
                 self.raft.handleAppendEntries(msg)
+            elif msgType == RESENTRIES:
+                self.raft.handleResponseEntries(msg)
 
-            # if not cliReq:
-            #     conn.close() 
+            if not cliReq:
+                conn.close() 
             sys.exit()
 
 
@@ -299,7 +426,6 @@ class RaftServer():
         while True: 
             tcpServer.listen(4) 
             (conn, (cliIP,cliPort)) = tcpServer.accept()
-            print 'Accepted coonection from %s' %repr(conn)
             newthread = self.ConnectionThread(conn, cliIP, cliPort, self) 
             newthread.start()
     
