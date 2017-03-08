@@ -13,7 +13,7 @@ REQVOTE = 'RequestVote'
 RESVOTE = 'ResponseVote'
 APPENDENTRIES = 'AppendEntries'
 RESENTRIES = 'ResponseEntries'
-CLIREQ = 'CLIREQ'
+CLIREQ = 'ClientRequest'
 
 STATES = {1: 'FOLLOWER', 2: 'CANDIDATE', 3: 'LEADER'}
 
@@ -24,18 +24,15 @@ class RaftServer():
         self.state = STATES[1]
         self.term = 0
         self.dcId = dcId
+        self.leaderId = None
         self.electionTimer = None
         self.heartbeatTimer = None
         self.voteCount = 0
         self.votedFor = {}
         self.followers = {}
-        self.commitIdx = 0 #-1
-        if dcId == 'dc1':
-            self.logEntries = [[0, 1, 1],[1, 1, 1], [2, 3, 1]]
-            self.newEntries = {1:1, 2:1}
-        else:
-            self.logEntries = [[0, 1, 1],[1, 2, 1], [2, 2, 1], [3, 2, 1], [4, 2, 1]]
-            self.newEntries = {}
+        self.commitIdx = -1
+        self.logEntries = []
+        self.replicatedIndexCount = {}
         self.readAndApplyConfig()
         self.initParam()
         self.resetElectionTimer()
@@ -61,7 +58,7 @@ class RaftServer():
 
     def readAndApplyConfig(self):
         '''Read from config file and update in memory variables'''
-        with open('server_config.json') as config_file:    
+        with open('config.json') as config_file:    
             self.config = json.load(config_file)
 
         self.election_timeout = self.config['election_timeout']
@@ -70,6 +67,7 @@ class RaftServer():
         self.logger = self.logFormatter(dcInfo)
         self.totalDcs = len(self.config["datacenters"])
         self.majority = self.totalDcs/2 + 1
+        self.tickets = self.config['tickets']
 
 
     def logFormatter(self, dcInfo):
@@ -129,6 +127,18 @@ class RaftServer():
             'followerId':self.dcId,
             'lastLogIdx':self.lastLogIdx,
             'success': success
+            }
+        }
+        return msg
+
+
+    def formClientResponseMsg(self, success=False, redirect=False, respMsg=None):
+        msg = { 
+        'ClientResponse': {
+            'leaderId': self.leaderId,
+            'success': success,
+            'redirect':redirect,
+            'response':respMsg
             }
         }
         return msg
@@ -215,6 +225,7 @@ class RaftServer():
     def convertToLeader(self):
         self.logger.debug('Converting to leader.')
         self.state = STATES[3]
+        self.leaderId = self.dcId
         self.initFollowerDetails()
         self.resetHeartbeatTimer()
 
@@ -277,9 +288,9 @@ class RaftServer():
         '''Starting from nextIdx of the follower who responded till its lastIdx, updated 
         replicated count of new entries that hasn't gotten majority yet'''
         while nextIdx <= msg['lastLogIdx']:
-            if nextIdx in self.newEntries:
-                self.newEntries[nextIdx] += 1
-                if self.newEntries[nextIdx] >= self.majority:
+            if nextIdx in self.replicatedIndexCount:
+                self.replicatedIndexCount[nextIdx] += 1
+                if self.replicatedIndexCount[nextIdx] >= self.majority:
                     self.updateCommitIdx(nextIdx)
             nextIdx += 1
 
@@ -296,8 +307,21 @@ class RaftServer():
             while self.commitIdx < nextIdx:
                 self.commitIdx += 1
                 self.logger.debug('Updated commited index to %d' %self.commitIdx)
-                #TODO: update state m/c
-                self.newEntries.pop(self.commitIdx)
+                '''Once an entry is commited, update ticket count and respond to client'''
+                self.executeClientRequest(self.commitIdx)
+                self.replicatedIndexCount.pop(self.commitIdx)
+
+
+    def executeClientRequest(self, idx):
+        '''Actual fucntion that decrements no. of tickets in the pool.
+        This fucntion is called only when majority of the followers have responded.'''
+
+        requestedTickets, reqId = self.getClientRequestFromLog(idx)
+        self.tickets -= requestedTickets
+        response = 'Successfully purchased %s tickets.' %requestedTickets    
+
+        respMsg = self.formClientResponseMsg(success=True, redirect=False, respMsg=response)
+        self.replyToClient(reqId, respMsg)
 
 
     ############################# Follower functionalities methods#############################
@@ -312,6 +336,7 @@ class RaftServer():
 
         else:
             self.term = msg['term']
+            self.leaderId = msg['leaderId']
             self.convertToFollower()
 
             '''Perform consistency check on logs of follower and leader'''
@@ -329,8 +354,9 @@ class RaftServer():
                     '''Success case: Keep entries only till prevLogIdx, to that append the newly sent entries'''
                     self.logEntries = self.logEntries[:msg['prevLogIdx']+1]
                     self.logEntries.extend(msg['entries'])
-                    self.lastLogIdx = len(self.logEntries)-1
-                    self.lastLogTerm = self.logEntries[self.lastLogIdx][1]
+                    if len(self.logEntries) > 0:
+                        self.lastLogIdx = len(self.logEntries)-1
+                        self.lastLogTerm = self.logEntries[self.lastLogIdx][1] 
                     success = True
 
                     if len(msg['entries']) > 0:
@@ -344,7 +370,46 @@ class RaftServer():
             self.sendTcpMsg(ip, port, respMsg)
 
 
-    ############################# Misc methods#############################
+    ############################# Client request methods #############################
+    def validRequest(self, requestedTickets):
+        '''Chech if there enough tickets to serve the clients request'''
+        print 'Tickets are %d' %self.tickets
+        if requestedTickets <= self.tickets:
+            return True
+        return False
+
+
+    def handleClientRequest(self, recvMsg, msg):
+        if not self.state == STATES[3]:
+            '''This server is not leader; reply client with redirect message'''
+            response = 'Current leader is %s. Please redirect request to server %s' %(self.leaderId, self.leaderId)
+            respMsg = self.formClientResponseMsg(success=False, redirect=True, respMsg=response)
+            self.replyToClient(msg['reqId'], respMsg)
+
+        else:
+            if self.validRequest(msg['tickets']):
+                #TODO: Check in logs for existing req
+                #TODO: Else, Add entry to log
+                self.lastLogIdx += 1
+                self.lastLogTerm = self.term
+                entry = self.getNextLogEntry(msg)
+                self.logEntries.append(entry)
+                '''Initialize count for this index as 1 in replicatedIndexCount variable'''
+                self.replicatedIndexCount[self.lastLogIdx] = 1
+                self.sendAppendEntriesToAll()
+            else:
+                '''Client requested too many tickets; repond with appropriate message'''
+                response = 'Total tickets available: '+str(self.tickets)+'. Tickets requested should be less that total tickets available.'
+                respMsg = self.formClientResponseMsg(success=False, redirect=False, respMsg=response)
+                self.replyToClient(msg['reqId'], respMsg)
+
+
+    def getNextLogEntry(self, msg):
+        #TODO: Storing result on request?
+        return [self.lastLogIdx, self.term, msg['tickets'], msg['reqId']]
+
+
+    ############################# Misc methods #############################
 
     def sendTcpMsg(self, ip, port, msg):
         tcpClient = socket.socket(socket.AF_INET, socket.SOCK_STREAM) 
@@ -354,12 +419,18 @@ class RaftServer():
         self.logger.debug(logMsg)
 
 
+    def replyToClient(self, reqId, respMsg):
+        clientId = reqId.split(':')[0]
+        ip, port = self.getClienrIpPort(clientId)
+        self.sendTcpMsg(ip, port, respMsg)
+
+
     def convertToFollower(self):
         self.logger.debug('Converting to follower.')
         self.state = STATES[1]
         self.voteCount = 0
         self.followers = {}
-        self.newEntries = {}
+        self.replicatedIndexCount = {}
         self.resetElectionTimer()
 
 
@@ -368,9 +439,18 @@ class RaftServer():
         return self.config['datacenters'][dcId][0], self.config['datacenters'][dcId][1]
 
 
+    def getClienrIpPort(self, clId):
+        '''Get ip and port on which client is listening from config'''
+        return self.config['clients'][clId][0], self.config['clients'][clId][1]
+
+
     def extractTermFromLog(self, logIdx):
         '''Implement from log'''
         return self.lastLogTerm
+
+
+    def getClientRequestFromLog(self, logIdx):
+        return self.logEntries[logIdx][2], self.logEntries[logIdx][3] 
 
 
     # Multithreaded Python server : TCP Server Socket Thread Pool
@@ -394,7 +474,7 @@ class RaftServer():
 
             if msgType==CLIREQ:
                 cliReq = True
-                self.raft.handleClientReq()
+                self.raft.handleClientRequest(recvMsg, msg)
             elif msgType == REQVOTE:
                 self.raft.handleVoteRequest(msg)
             elif msgType == RESVOTE:
