@@ -1,17 +1,19 @@
 {
 	"datacenters": {
 		"dc1": ["127.0.0.1", 5001],
-		"dc2": ["127.0.0.1", 5002]
+		"dc2": ["127.0.0.1", 5002],
+		"dc3": ["127.0.0.1", 5003]
 	},
 
 	"clients": {
 		"cl1": ["127.0.0.1", 6001],
-		"cl2": ["127.0.0.1", 6002]
+		"cl2": ["127.0.0.1", 6002],
+		"cl3": ["127.0.0.1", 6003]
 	},
 
 	"tickets": 100,
 
 	"election_timeout":[4,8],
-	"heartbeat_timeout":3,
-	"client_request_timeout": 20
+	"heartbeat_timeout":2,
+	"client_request_timeout": 5
 }
