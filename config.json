@@ -11,6 +11,14 @@
 		"cl3": ["127.0.0.1", 6003]
 	},
 
+	"client_server_map": {
+		"cl1":"dc1",
+		"cl2":"dc2",
+		"cl3":"dc3",
+		"cl4":"dc4",
+		"cl5":"dc5"
+	},
+
 	"tickets": 100,
 
 	"election_timeout":[4,8],

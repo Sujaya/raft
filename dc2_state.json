@@ -1,0 +1,10 @@
+{
+    "state":"Follower",
+    "term":0,
+    "leaderId":"None",
+    "votedFor": {},
+    "followers":{},
+    "commitIdx":-1,
+    "replicatedIndexCount":{},
+    "tickets":100
+}

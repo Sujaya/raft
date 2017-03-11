@@ -10,6 +10,8 @@ logging.basicConfig(filename='client.log',level=logging.DEBUG)
 
 clientId = sys.argv[1]
 BUFFER_SIZE = 2000 
+CLIRES= 'ClientResponse'
+SHOWRES= 'ShowResponse'
  
 class RaftClient():
 
@@ -47,6 +49,15 @@ class RaftClient():
         return msg
 
 
+    def formShowCommandMsg(self):
+        msg = { 
+        'ShowRequest': {
+             'reqId': self.clientId + ':' + str(self.reqId) 
+            }
+        }
+        return msg        
+
+
     def parseRecvMsg(self, recvMsg):
             ''' msg = {'leaderId': <id>, 'response':<>}'''
             recvMsg = json.loads(recvMsg)
@@ -67,18 +78,24 @@ class RaftClient():
             (conn, (cliIP,cliPort)) = tcpClient.accept()
             
             data = conn.recv(BUFFER_SIZE)
-            self.cancelTimer()
             # while not data:
             #     data = tcpClient.recv(BUFFER_SIZE)
-            _, msg = self.parseRecvMsg(data)
+            msgType, msg = self.parseRecvMsg(data)
 
             '''Update leader id based on the server response'''
             self.leaderId = msg['leaderId']
             print msg['response']
 
-            if msg['redirect'] == True:
-                self.requestTicket()
+            if msgType == CLIRES:
+                '''If its response for ticket request, cancel timer and handle the message accordingly'''
+                self.cancelTimer()
+                if msg['redirect'] == True:
+                    self.requestTicket()
+                else:
+                    self.requestTicketsFromUser()
+
             else:
+                '''If its response of show, continue prompting user'''
                 self.requestTicketsFromUser()
 
 
@@ -133,19 +150,48 @@ class RaftClient():
         self.sendRequest()
 
 
+    def sendShowCommand(self):
+        dcId = self.config['client_server_map'][clientId]
+        ip, port = self.getServerIpPort(dcId)
+        reqMsg = self.formShowCommandMsg()
+        reqMsg = json.dumps(reqMsg)
+        try:
+            tcpClient = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            tcpClient.settimeout(1)
+            tcpClient.connect((ip, port))
+            tcpClient.send(reqMsg)
+            time.sleep(0.5)
+            tcpClient.close()
+        except Exception as e:
+            '''When a site is down, tcp connect fails and raises exception; catching and 
+            ignoring it as we don't care about sites that are down'''
+            pass
+
+
     def requestTicketsFromUser(self): 
         '''Take request from user and request tickets from server''' 
         while True:
-            noOfTickets = raw_input("Enter no. of tickets: ")
-            if noOfTickets <= 0:
-                print 'Invalid entry! Please enter a valid ticket count.'
+            choice = raw_input("\nChoose an option:\na) Press 1 to show log on the server.\nb) Press 2 to buy tickets.\n")
+            choice = int(choice)
+            if choice != 1 and choice != 2:
+                print 'Invalid option! Please enter either 1 or 2.'
                 continue
+
+            if choice == 2: 
+                noOfTickets = raw_input("Enter no. of tickets: ")
+                noOfTickets = int(noOfTickets)
+                if noOfTickets <= 0:
+                    print 'Invalid entry! Please enter a valid ticket count.'
+                    continue
             break
 
-        self.tickets = int(noOfTickets)
-        '''Increment request id on each valid user request'''
-        self.reqId += 1
-        self.sendRequest()
+        if choice == 1:
+            self.sendShowCommand()
+        else:
+            self.tickets = noOfTickets
+            '''Increment request id on each valid user request'''
+            self.reqId += 1
+            self.sendRequest()
         
         
 client = RaftClient(clientId)
