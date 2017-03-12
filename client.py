@@ -12,6 +12,10 @@ clientId = sys.argv[1]
 BUFFER_SIZE = 2000 
 CLIRES= 'ClientResponse'
 SHOWRES= 'ShowResponse'
+TICKETREQ = 'TicketRequest'
+CONFIGCHANGE = 'ConfigChangeRequest'
+
+NEWCONFIG = 'new_config.json'
  
 class RaftClient():
 
@@ -20,6 +24,7 @@ class RaftClient():
         self.reqId = 0
         self.clientId = clientId
         self.tickets = 0
+        self.lastReq = None
         self.readAndApplyConfig()
         thread = Thread(target = self.requestTicketsFromUser)
         thread.start()
@@ -53,6 +58,16 @@ class RaftClient():
         msg = { 
         'ShowRequest': {
              'reqId': self.clientId + ':' + str(self.reqId) 
+            }
+        }
+        return msg
+
+
+    def formConfigChangeCmdMsg(self):
+        msg = { 
+        'ConfigChangeRequest': {
+             'reqId': self.clientId + ':' + str(self.reqId),
+             'configFile': NEWCONFIG
             }
         }
         return msg        
@@ -143,7 +158,10 @@ class RaftClient():
             if dcId != oldLeader:
                 self.leaderId = dcId
                 break
-        self.sendRequest()
+        if self.lastReq == TICKETREQ:
+            self.sendRequest()
+        elif self.lastReq == CONFIGCHANGE:
+            self.sendConfigChangeCommand()
 
 
     def requestTicket(self):
@@ -168,16 +186,44 @@ class RaftClient():
             pass
 
 
+    def sendConfigChangeCommand(self):
+        if not self.leaderId:
+            '''If leader is not known, randomly choose a server and request tickets'''
+            dcId =  random.randint(1, len(self.config['datacenters']))
+            dcId = 'dc'+str(dcId)
+        else:
+            dcId = self.leaderId
+
+        ip, port = self.getServerIpPort(dcId)
+        reqMsg = self.formConfigChangeCmdMsg()
+        reqMsg = json.dumps(reqMsg)
+        try:
+            tcpClient = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            '''Start timer to get a reply within certain time; if timeout happens, resend the same request'''
+            self.startTimer()
+            tcpClient.settimeout(1)
+            tcpClient.connect((ip, port))
+            tcpClient.send(reqMsg)
+            time.sleep(0.5)
+            tcpClient.close()
+        except Exception as e:
+            '''When a site is down, tcp connect fails and raises exception; catching and 
+            ignoring it as we don't care about sites that are down'''
+            pass
+
+
     def requestTicketsFromUser(self): 
         '''Take request from user and request tickets from server''' 
         while True:
-            choice = raw_input("\nChoose an option:\na) Press 1 to show log on the server.\nb) Press 2 to buy tickets.\n")
+            displayMsg = "\nChoose an option:\na) Press 1 to buy tickets.\nb) Press 2 to show log on the server.\n"
+            displayMsg += "c) Press 3 initiate configuration change.\n"
+            choice = raw_input(displayMsg)
             choice = int(choice)
-            if choice != 1 and choice != 2:
+            if choice != 1 and choice != 2 and choice != 3:
                 print 'Invalid option! Please enter either 1 or 2.'
                 continue
 
-            if choice == 2: 
+            if choice == 1: 
                 noOfTickets = raw_input("Enter no. of tickets: ")
                 noOfTickets = int(noOfTickets)
                 if noOfTickets <= 0:
@@ -185,13 +231,19 @@ class RaftClient():
                     continue
             break
 
+        
         if choice == 1:
-            self.sendShowCommand()
-        else:
             self.tickets = noOfTickets
             '''Increment request id on each valid user request'''
             self.reqId += 1
+            self.lastReq = TICKETREQ
             self.sendRequest()
+        elif choice == 2:
+            self.sendShowCommand()
+        else:
+            self.reqId += 1
+            self.lastReq = CONFIGCHANGE
+            self.sendConfigChangeCommand()
         
         
 client = RaftClient(clientId)

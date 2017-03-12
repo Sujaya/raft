@@ -7,6 +7,7 @@ import json, sys
 import logging
 import random
 import csv
+import copy
 
 ######################Constants######################
 REQVOTE = 'RequestVote'
@@ -15,6 +16,10 @@ APPENDENTRIES = 'AppendEntries'
 RESENTRIES = 'ResponseEntries'
 CLIREQ = 'ClientRequest'
 SHOWREQ = 'ShowRequest'
+CONFIGCHANGE = 'ConfigChangeRequest'
+
+PHASE1 = -1
+PHASE2 = -2
 
 STATES = {1: 'FOLLOWER', 2: 'CANDIDATE', 3: 'LEADER'}
 
@@ -27,6 +32,8 @@ class RaftServer():
         self.heartbeatTimer = None
         self.voteCount = 0
         self.logEntries = []
+        self.oldConfig = None
+        self.newConfig = None
 
         # self.state = STATES[1]
         # self.term = 0
@@ -36,8 +43,8 @@ class RaftServer():
         # self.commitIdx = -1
         # self.logEntries = []
         # self.replicatedIndexCount = {}
-        self.readAndApplyConfig()
         self.initParam()
+        self.readAndApplyConfig()
         self.resetElectionTimer()
         self.startServer()
 
@@ -61,6 +68,7 @@ class RaftServer():
         self.commitIdx = state['commitIdx']
         self.replicatedIndexCount = state['replicatedIndexCount']
         self.tickets = state['tickets']
+        self.configFile = state['configFile']
         
 
     def initLogEntries(self):
@@ -86,16 +94,15 @@ class RaftServer():
 
     def readAndApplyConfig(self):
         '''Read from config file and update in memory variables'''
-        with open('config.json') as config_file:    
+        with open(self.configFile) as config_file:    
             self.config = json.load(config_file)
 
         self.election_timeout = self.config['election_timeout']
         self.heartbeat_timeout = self.config['heartbeat_timeout']
         dcInfo= {'dc_name':self.dcId.upper()}
         self.logger = self.logFormatter(dcInfo)
-        self.totalDcs = len(self.config["datacenters"])
-        self.majority = self.totalDcs/2 + 1
-        self.tickets = self.config['tickets']
+        totalDcs = len(self.config["datacenters"])
+        self.majority = totalDcs/2 + 1
 
 
     def logFormatter(self, dcInfo):
@@ -125,7 +132,8 @@ class RaftServer():
             "followers":self.followers,
             "commitIdx":self.commitIdx,
             "replicatedIndexCount":self.replicatedIndexCount,
-            "tickets":self.tickets
+            "tickets":self.tickets,
+            "configFile":self.configFile
         }
 
         with open(self.dcId +'_state.json', 'w') as fp:
@@ -217,6 +225,7 @@ class RaftServer():
             self.electionTimer.cancel()
 
         timeout = random.uniform(self.election_timeout[0], self.election_timeout[1])
+        #print 'Timeout is %.2f' %timeout
         self.electionTimer = threading.Timer(timeout, self.startElection)
         self.electionTimer.start()
 
@@ -224,6 +233,7 @@ class RaftServer():
     def startElection(self):
         '''If not already a leader, change to candidate, increment term and req vote'''
         if not self.state == STATES[3]:
+            self.voteCount = 0
             self.state = STATES[2]
             self.term += 1
             self.votedFor[self.term] = self.dcId
@@ -307,8 +317,16 @@ class RaftServer():
         for dcId in self.config['datacenters']:
             if dcId == self.dcId:
                 continue
-            '''Initialize nextIdx for each follower as leader's lastIdx+1.'''
-            self.followers[dcId] = self.lastLogIdx + 1
+            if dcId not in self.followers:
+                '''Initialize nextIdx for each follower as leader's lastIdx+1.'''
+                self.followers[dcId] = self.lastLogIdx + 1
+
+        '''If there are any servers that are removed in the current config, 
+        remove it from follower list'''
+        currentFollowers = self.followers.keys()
+        for dcId in currentFollowers:
+            if dcId not in self.config['datacenters']:
+                self.followers.pop(dcId)
 
 
     def sendAppendEntriesToAll(self):
@@ -373,9 +391,20 @@ class RaftServer():
                 self.commitIdx += 1
                 self.logger.debug('Updated commited index to %d' %self.commitIdx)
                 self.replicatedIndexCount.pop(self.commitIdx)
+                self.checkAndCommitConfigChange(self.commitIdx)
                 '''Once an entry is commited, update ticket count and respond to client'''
                 self.executeClientRequest(self.commitIdx, respondToClient=True)
                 
+
+
+    def checkAndCommitConfigChange(self, commitIdx):
+        cmd, reqId = self.getClientRequestFromLog(self.commitIdx)
+        if cmd == PHASE1:
+            self.handleConfigChange(PHASE2, reqId)
+        elif cmd == PHASE2:
+            response = 'Successfully changed configuration.'
+            respMsg = self.formClientResponseMsg(success=True, redirect=False, respMsg=response)
+            self.replyToClient(reqId, respMsg)
 
     ############################# Follower functionalities methods #############################
 
@@ -406,9 +435,10 @@ class RaftServer():
                     '''Success case: Keep entries only till prevLogIdx, to that append the newly sent entries'''
                     self.logEntries = self.logEntries[:msg['prevLogIdx']+1]
                     self.logEntries.extend(msg['entries'])
-                    if len(self.logEntries) > 0:
+                    if len(msg['entries']) > 0:
                         self.lastLogIdx = len(self.logEntries)-1
-                        self.lastLogTerm = self.logEntries[self.lastLogIdx][1] 
+                        self.lastLogTerm = self.logEntries[self.lastLogIdx][1]
+                        self.checkForConfigChange(msg['entries'])
                     success = True
                     if msg['commitIdx'] > self.commitIdx:
                         self.updateCommitIdxOfFollower(msg['commitIdx'])
@@ -417,7 +447,7 @@ class RaftServer():
                         self.logger.debug('Updated (lastLogIdx, lastLogTerm, logEntries) to (%d, %d, %s)' \
                         %(self.lastLogIdx, self.lastLogTerm, repr(self.logEntries)))
 
-        if len(msg['entries']) > 0:
+        if len(msg['entries']) > 0 or success==False:
             '''Respond only for msgs that are not heartbeats'''
             respMsg = self.formResponseEntriesMsg(success=success)
             ip, port = self.getServerIpPort(msg['leaderId'])
@@ -465,7 +495,7 @@ class RaftServer():
                 #TODO: Check in logs for existing req
                 self.lastLogIdx += 1
                 self.lastLogTerm = self.term
-                entry = self.getNextLogEntry(msg)
+                entry = self.getNextLogEntry(msg['tickets'], msg['reqId'])
                 self.logEntries.append(entry)
                 '''Initialize count for this index as 1 in replicatedIndexCount variable'''
                 self.replicatedIndexCount[self.lastLogIdx] = 1
@@ -473,14 +503,15 @@ class RaftServer():
                 self.writeLogEntriesToFile()
             else:
                 '''Client requested too many tickets; repond with appropriate message'''
-                response = 'Total tickets available: '+str(self.tickets)+'. Tickets requested should be less that total tickets available.'
+                response = 'Total tickets available: '+str(self.tickets)+'.'
+                response += ' Tickets requested should be less that total tickets available.'
                 respMsg = self.formClientResponseMsg(success=False, redirect=False, respMsg=response)
                 self.replyToClient(msg['reqId'], respMsg)
 
 
-    def getNextLogEntry(self, msg):
+    def getNextLogEntry(self, command, reqId):
         #TODO: Storing result on request?
-        return [self.lastLogIdx, self.term, msg['tickets'], msg['reqId']]
+        return [self.lastLogIdx, self.term, command, reqId]
 
 
     def executeClientRequest(self, idx, respondToClient=False):
@@ -488,20 +519,103 @@ class RaftServer():
         This fucntion is called only when majority of the followers have responded.'''
 
         requestedTickets, reqId = self.getClientRequestFromLog(idx)
-        self.tickets -= requestedTickets
+        if requestedTickets > 0:
+            self.tickets -= requestedTickets
 
-        if respondToClient:
-            response = 'Successfully purchased %s tickets.' %requestedTickets    
-            respMsg = self.formClientResponseMsg(success=True, redirect=False, respMsg=response)
-            self.replyToClient(reqId, respMsg)
+            if respondToClient:
+                response = 'Successfully purchased %s tickets.' %requestedTickets    
+                respMsg = self.formClientResponseMsg(success=True, redirect=False, respMsg=response)
+                self.replyToClient(reqId, respMsg)
 
 
     def handleShowCommand(self, msg):
-        response = 'Log format is <"logIdx", "logTerm", "tickets", "reqID">.\n'
-        response += 'Current log that is present on server %s is:\n%s' %(self.dcId, repr(self.logEntries))
+        response = 'Current log that is present on server %s is:\n' %(self.dcId)
+        
+        for entry in self.logEntries:
+            cmd = entry[2]
+            if cmd == -1:
+                logResp = str(entry[0]) + ': Config change (old + new).\n'
+            elif cmd == -2:
+                logResp = str(entry[0]) + ': Config change (new).\n'
+            else:
+                clientId = entry[3].split(':')[0]
+                logResp = str(entry[0]) + ': Client %s bought %d tickets successfully.\n' %(clientId, cmd)
+
+            response += logResp
         respMsg = self.formShowResponseMsg(respMsg=response)
         self.replyToClient(msg['reqId'], respMsg)
 
+
+    ############################# Config change methods #############################
+
+    def handleConfigChange(self, phase, reqId):
+        '''Add entry to log, update config and send AppendEntriesRPC to all'''
+        self.lastLogIdx += 1
+        self.lastLogTerm = self.term
+        entry = self.getNextLogEntry(phase, reqId)
+        self.logEntries.append(entry)
+        '''Initialize count for this index as 1 in replicatedIndexCount variable'''
+        self.replicatedIndexCount[self.lastLogIdx] = 1
+        self.updateConfig(phase)
+        self.sendAppendEntriesToAll()
+        self.writeLogEntriesToFile()
+
+
+    def updateConfig(self, phase):
+        '''For PHASE1 read the changed config from file and store in a variable.
+        For PHASE2 just move to the stored values'''
+        if phase == PHASE1:
+            self.oldConfig = copy.deepcopy(self.config)
+            self.readAndApplyNewConfig()
+        else:
+            self.moveToNewConfig()
+
+        self.writeStateToFile()
+
+
+    def readAndApplyNewConfig(self):
+        '''Read from config file and update in memory variables'''
+        with open(self.configFile) as config_file:    
+            self.newConfig = json.load(config_file)
+
+        '''From the newly read config, update my current config such that it
+        is old + new config'''
+        for dcId in self.newConfig['datacenters']:
+             if dcId not in self.config:
+                self.config['datacenters'][dcId] = self.newConfig['datacenters'][dcId]
+
+        if self.state == STATES[3]:
+            '''If the server is current leader, it should add newly added followers to the 
+            follower list and set their nextIdx'''
+            self.initFollowerDetails()
+
+        self.config['clients'] = self.newConfig['clients']
+        oldDcs = len(self.oldConfig["datacenters"])
+        newDcs = len(self.newConfig["datacenters"])
+        self.majority = (oldDcs+newDcs)/2 
+
+
+    def moveToNewConfig(self):
+        '''Since newConfig contains the right config, move current config to new one
+        and update majority'''
+        if self.newConfig:
+            self.config['datacenters'] = self.newConfig['datacenters']
+        totalDcs = len(self.config["datacenters"])
+        self.majority = (totalDcs)/2 + 1
+        self.oldConfig, self.newConfig = None, None
+        '''If there are any servers that are deleted, update followers accordingly'''
+        self.initFollowerDetails()
+
+
+    def checkForConfigChange(self, newEntries):
+        '''Go through all newly sent entries, check if any of them are config changes
+        for phase1 or phase2, and update config accordingly'''
+        for entry in newEntries:
+            cmd = entry[2]
+            if cmd == PHASE1:
+                self.updateConfig(PHASE1)
+            elif cmd == PHASE2:
+                self.updateConfig(PHASE2)
 
     ############################# Misc methods #############################
 
@@ -581,6 +695,9 @@ class RaftServer():
                 self.raft.handleAppendEntries(msg)
             elif msgType == RESENTRIES:
                 self.raft.handleResponseEntries(msg)
+            elif msgType == CONFIGCHANGE:
+                self.configFile = msg['configFile'] 
+                self.raft.handleConfigChange(PHASE1, msg['reqId'])
 
             if not cliReq:
                 conn.close() 
