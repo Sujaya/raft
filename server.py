@@ -18,6 +18,8 @@ CLIREQ = 'ClientRequest'
 SHOWREQ = 'ShowRequest'
 CONFIGCHANGE = 'ConfigChangeRequest'
 
+CONFIGFILE = 'config.json'
+
 PHASE1 = -1
 PHASE2 = -2
 
@@ -31,28 +33,20 @@ class RaftServer():
         self.electionTimer = None
         self.heartbeatTimer = None
         self.voteCount = 0
+        self.replicatedIndexCount = {}
         self.logEntries = []
         self.oldConfig = None
         self.newConfig = None
 
-        # self.state = STATES[1]
-        # self.term = 0
-        # self.leaderId = None
-        # self.votedFor = {}
-        # self.followers = {}
-        # self.commitIdx = -1
-        # self.logEntries = []
-        # self.replicatedIndexCount = {}
         self.initParam()
-        self.readAndApplyConfig()
         self.resetElectionTimer()
         self.startServer()
 
 
     def initParam(self):
         '''Read from log file and update in memory variables based on last log entry'''
-        #Optimize
         self.initState()
+        self.applyConfig()
         self.initLogEntries()
 
 
@@ -66,9 +60,8 @@ class RaftServer():
         self.votedFor = state['votedFor']
         self.followers = state['followers']
         self.commitIdx = state['commitIdx']
-        self.replicatedIndexCount = state['replicatedIndexCount']
         self.tickets = state['tickets']
-        self.configFile = state['configFile']
+        self.config = state['config']
         
 
     def initLogEntries(self):
@@ -92,10 +85,8 @@ class RaftServer():
         self.lastLogTerm = lastLog[1]
 
 
-    def readAndApplyConfig(self):
+    def applyConfig(self):
         '''Read from config file and update in memory variables'''
-        with open(self.configFile) as config_file:    
-            self.config = json.load(config_file)
 
         self.election_timeout = self.config['election_timeout']
         self.heartbeat_timeout = self.config['heartbeat_timeout']
@@ -131,13 +122,12 @@ class RaftServer():
             "votedFor": self.votedFor,
             "followers":self.followers,
             "commitIdx":self.commitIdx,
-            "replicatedIndexCount":self.replicatedIndexCount,
             "tickets":self.tickets,
-            "configFile":self.configFile
+            "config":self.config
         }
 
         with open(self.dcId +'_state.json', 'w') as fp:
-            json.dump(state, fp, sort_keys=True, indent=4)
+            json.dump(state, fp, indent=4)
         
 
     ############################# Message forming methods#############################
@@ -225,7 +215,7 @@ class RaftServer():
             self.electionTimer.cancel()
 
         timeout = random.uniform(self.election_timeout[0], self.election_timeout[1])
-        #print 'Timeout is %.2f' %timeout
+
         self.electionTimer = threading.Timer(timeout, self.startElection)
         self.electionTimer.start()
 
@@ -396,7 +386,6 @@ class RaftServer():
                 self.executeClientRequest(self.commitIdx, respondToClient=True)
                 
 
-
     def checkAndCommitConfigChange(self, commitIdx):
         cmd, reqId = self.getClientRequestFromLog(self.commitIdx)
         if cmd == PHASE1:
@@ -421,7 +410,6 @@ class RaftServer():
             self.convertToFollower()
 
             '''Perform consistency check on logs of follower and leader'''
-            #Verify***
             if self.lastLogIdx < msg['prevLogIdx']:
                 '''Missing entries case: send failure so that leader decrements next index and retries'''
                 success = False
@@ -492,7 +480,6 @@ class RaftServer():
 
         else:
             if self.validRequest(msg['tickets']):
-                #TODO: Check in logs for existing req
                 self.lastLogIdx += 1
                 self.lastLogTerm = self.term
                 entry = self.getNextLogEntry(msg['tickets'], msg['reqId'])
@@ -510,7 +497,7 @@ class RaftServer():
 
 
     def getNextLogEntry(self, command, reqId):
-        #TODO: Storing result on request?
+        '''Get the format of how new log entry should be'''
         return [self.lastLogIdx, self.term, command, reqId]
 
 
@@ -575,7 +562,7 @@ class RaftServer():
 
     def readAndApplyNewConfig(self):
         '''Read from config file and update in memory variables'''
-        with open(self.configFile) as config_file:    
+        with open(CONFIGFILE) as config_file:    
             self.newConfig = json.load(config_file)
 
         '''From the newly read config, update my current config such that it
@@ -695,8 +682,7 @@ class RaftServer():
                 self.raft.handleAppendEntries(msg)
             elif msgType == RESENTRIES:
                 self.raft.handleResponseEntries(msg)
-            elif msgType == CONFIGCHANGE:
-                self.configFile = msg['configFile'] 
+            elif msgType == CONFIGCHANGE: 
                 self.raft.handleConfigChange(PHASE1, msg['reqId'])
 
             if not cliReq:

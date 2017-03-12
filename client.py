@@ -15,8 +15,16 @@ SHOWRES= 'ShowResponse'
 TICKETREQ = 'TicketRequest'
 CONFIGCHANGE = 'ConfigChangeRequest'
 
-NEWCONFIG = 'new_config.json'
- 
+CONFIGFILE = 'config.json'
+
+client_server_map =  {
+    "cl1":"dc1",
+    "cl2":"dc2",
+    "cl3":"dc3",
+    "cl4":"dc4",
+    "cl5":"dc5"
+}
+
 class RaftClient():
 
     def __init__(self, clientId):
@@ -28,12 +36,11 @@ class RaftClient():
         self.readAndApplyConfig()
         thread = Thread(target = self.requestTicketsFromUser)
         thread.start()
-        #self.requestTicketsFromUser()
         self.startListening()
 
 
     def readAndApplyConfig(self):
-        with open('config.json') as config_file:    
+        with open(CONFIGFILE) as config_file:    
             self.config = json.load(config_file)
         self.timeout = self.config['client_request_timeout']
 
@@ -67,7 +74,7 @@ class RaftClient():
         msg = { 
         'ConfigChangeRequest': {
              'reqId': self.clientId + ':' + str(self.reqId),
-             'configFile': NEWCONFIG
+             'configFile': CONFIGFILE
             }
         }
         return msg        
@@ -93,8 +100,6 @@ class RaftClient():
             (conn, (cliIP,cliPort)) = tcpClient.accept()
             
             data = conn.recv(BUFFER_SIZE)
-            # while not data:
-            #     data = tcpClient.recv(BUFFER_SIZE)
             msgType, msg = self.parseRecvMsg(data)
 
             '''Update leader id based on the server response'''
@@ -107,6 +112,8 @@ class RaftClient():
                 if msg['redirect'] == True:
                     self.requestTicket()
                 else:
+                    if self.lastReq == CONFIGCHANGE:
+                        self.readAndApplyConfig()
                     self.requestTicketsFromUser()
 
             else:
@@ -169,7 +176,7 @@ class RaftClient():
 
 
     def sendShowCommand(self):
-        dcId = self.config['client_server_map'][clientId]
+        dcId = client_server_map[clientId]
         ip, port = self.getServerIpPort(dcId)
         reqMsg = self.formShowCommandMsg()
         reqMsg = json.dumps(reqMsg)
