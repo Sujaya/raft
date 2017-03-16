@@ -92,7 +92,7 @@ class RaftServer():
         self.heartbeat_timeout = self.config['heartbeat_timeout']
         dcInfo= {'dc_name':self.dcId.upper()}
         self.logger = self.logFormatter(dcInfo)
-        totalDcs = len(self.config["datacenters"])
+        totalDcs = len(self.config['datacenters'])
         self.majority = totalDcs/2 + 1
 
 
@@ -221,8 +221,9 @@ class RaftServer():
 
 
     def startElection(self):
-        '''If not already a leader, change to candidate, increment term and req vote'''
-        if not self.state == STATES[3]:
+        '''Start election only if not already a leader and current server is present in the config'''
+        if (not self.state == STATES[3]) and (self.dcId in self.config['datacenters']):
+            '''If not already a leader, change to candidate, increment term and req vote'''
             self.voteCount = 0
             self.state = STATES[2]
             self.term += 1
@@ -235,16 +236,20 @@ class RaftServer():
     def requestVote(self):
         reqMsg = self.formRequestVoteMsg()
         self.resetElectionTimer()
-        for dcId in self.config["datacenters"]:
+        for dcId in self.config['datacenters']:
             if dcId == self.dcId:
                 continue
-            ip, port = self.config["datacenters"][dcId][0], self.config["datacenters"][dcId][1]
+            ip, port = self.getServerIpPort(dcId)
             self.sendTcpMsg(ip, port, reqMsg)
 
 
     def handleVoteRequest(self, msg):
         grantingVote = False
         ip, port = self.getServerIpPort(msg['candidateId'])
+
+        if msg['candidateId'] not in self.config['datacenters']:
+            '''If candidate is not in current cofig, ignore it's vote requests'''
+            return
 
         if msg['term'] > self.term:
             '''Update term if it is lesser than candidat'e term'''
@@ -311,13 +316,6 @@ class RaftServer():
                 '''Initialize nextIdx for each follower as leader's lastIdx+1.'''
                 self.followers[dcId] = self.lastLogIdx + 1
 
-        '''If there are any servers that are removed in the current config, 
-        remove it from follower list'''
-        currentFollowers = self.followers.keys()
-        for dcId in currentFollowers:
-            if dcId not in self.config['datacenters']:
-                self.followers.pop(dcId)
-
 
     def sendAppendEntriesToAll(self):
         for dcId in self.followers:
@@ -350,12 +348,19 @@ class RaftServer():
         '''Consistency check has failed for this follower.
         Decrement it's nextIdx and retry appendEntries RPC'''
         followerId = msg['followerId']
-        self.followers[followerId] -= 1
-        self.sendAppendEntriesMsg(followerId)
+        if followerId in self.followers:
+            self.followers[followerId] -= 1
+            self.sendAppendEntriesMsg(followerId)
 
 
     def updateReplicationCount(self, msg):
         followerId = msg['followerId']
+        if followerId not in self.config['datacenters']:
+            '''If a stale follower responds, remove it from the follower list and 
+            do not perform any more operation'''
+            self.followers.pop(followerId)
+            return
+
         nextIdx = self.followers[followerId]
         
         '''Starting from nextIdx of the follower who responded till its lastIdx, updated 
@@ -380,7 +385,8 @@ class RaftServer():
             while self.commitIdx < nextIdx:
                 self.commitIdx += 1
                 self.logger.debug('Updated commited index to %d' %self.commitIdx)
-                self.replicatedIndexCount.pop(self.commitIdx)
+                if self.commitIdx in self.replicatedIndexCount:
+                    self.replicatedIndexCount.pop(self.commitIdx)
                 self.checkAndCommitConfigChange(self.commitIdx)
                 '''Once an entry is commited, update ticket count and respond to client'''
                 self.executeClientRequest(self.commitIdx, respondToClient=True)
@@ -389,11 +395,20 @@ class RaftServer():
     def checkAndCommitConfigChange(self, commitIdx):
         cmd, reqId = self.getClientRequestFromLog(self.commitIdx)
         if cmd == PHASE1:
+            '''If we get majority for PHASE1, initiate PHASE2'''
             self.handleConfigChange(PHASE2, reqId)
         elif cmd == PHASE2:
+            '''If we get majority of PHASE2, reply to client'''
             response = 'Successfully changed configuration.'
             respMsg = self.formClientResponseMsg(success=True, redirect=False, respMsg=response)
             self.replyToClient(reqId, respMsg)
+
+            if self.dcId not in self.config['datacenters']:
+                self.sendAppendEntriesToAll()
+                '''If current server is leader and it is not in new config, make it a follower'''
+                self.convertToFollower()
+                self.leaderId = None
+
 
     ############################# Follower functionalities methods #############################
 
@@ -459,6 +474,9 @@ class RaftServer():
         self.voteCount = 0
         self.followers = {}
         self.replicatedIndexCount = {}
+        if self.heartbeatTimer:
+            '''Cancel heartbeat timer once it converts to follower'''
+            self.heartbeatTimer.cancel()
         self.resetElectionTimer()
         self.writeStateToFile()
 
@@ -569,8 +587,8 @@ class RaftServer():
         '''From the newly read config, update my current config such that it
         is old + new config'''
         for dcId in self.newConfig['datacenters']:
-             if dcId not in self.config:
-                self.config['datacenters'][dcId] = self.newConfig['datacenters'][dcId]
+             if dcId not in self.config['datacenters']:
+                self.config['datacenters'].append(dcId)
 
         if self.state == STATES[3]:
             '''If the server is current leader, it should add newly added followers to the 
@@ -578,8 +596,8 @@ class RaftServer():
             self.initFollowerDetails()
 
         self.config['clients'] = self.newConfig['clients']
-        oldDcs = len(self.oldConfig["datacenters"])
-        newDcs = len(self.newConfig["datacenters"])
+        oldDcs = len(self.oldConfig['datacenters'])
+        newDcs = len(self.newConfig['datacenters'])
         self.majority = (oldDcs+newDcs)/2 
 
 
@@ -587,12 +605,10 @@ class RaftServer():
         '''Since newConfig contains the right config, move current config to new one
         and update majority'''
         if self.newConfig:
-            self.config['datacenters'] = self.newConfig['datacenters']
-        totalDcs = len(self.config["datacenters"])
+            self.config['datacenters'] = copy.deepcopy(self.newConfig['datacenters'])
+        totalDcs = len(self.config['datacenters'])
         self.majority = (totalDcs)/2 + 1
         self.oldConfig, self.newConfig = None, None
-        '''If there are any servers that are deleted, update followers accordingly'''
-        self.initFollowerDetails()
 
 
     def checkForConfigChange(self, newEntries):
@@ -631,7 +647,7 @@ class RaftServer():
 
     def getServerIpPort(self, dcId):
         '''Get ip and port on which server is listening from config'''
-        return self.config['datacenters'][dcId][0], self.config['datacenters'][dcId][1]
+        return self.config['dc_addresses'][dcId][0], self.config['dc_addresses'][dcId][1]
 
 
     def getClientIpPort(self, clId):
@@ -674,11 +690,8 @@ class RaftServer():
             if display:
                 logMsg = 'Received message from: (%s:%d). Message is: %s' %(self.ip, self.port, recvMsg)
                 self.raft.logger.debug(logMsg)
-
-            if msgType == CLIREQ:
-                cliReq = True
-                self.raft.handleClientRequest(recvMsg, msg)
-            elif msgType == SHOWREQ:
+    
+            if msgType == SHOWREQ:
                 cliReq = True
                 self.raft.handleShowCommand(msg)
             elif msgType == REQVOTE:
@@ -687,7 +700,11 @@ class RaftServer():
                 self.raft.handleVoteReply(msg)
             elif msgType == APPENDENTRIES:
                 self.raft.handleAppendEntries(msg)
-            elif msgType == RESENTRIES:
+            elif msgType == CLIREQ:
+                cliReq = True
+                self.raft.handleClientRequest(recvMsg, msg)
+            elif msgType == RESENTRIES and self.raft.state == STATES[3]:
+                '''Only leader should handle response entries'''
                 self.raft.handleResponseEntries(msg)
             elif msgType == CONFIGCHANGE: 
                 self.raft.handleConfigChange(PHASE1, msg['reqId'])
@@ -704,7 +721,7 @@ class RaftServer():
 
 
     def startServer(self):
-        ip, port = self.config["datacenters"][self.dcId][0], self.config["datacenters"][self.dcId][1]
+        ip, port = self.getServerIpPort(self.dcId)
 
         tcpServer = socket.socket(socket.AF_INET, socket.SOCK_STREAM) 
         tcpServer.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) 

@@ -43,12 +43,14 @@ class RaftClient():
         with open(CONFIGFILE) as config_file:    
             self.config = json.load(config_file)
         self.timeout = self.config['client_request_timeout']
+        if self.leaderId not in self.config['datacenters']:
+            self.leaderId = None
 
 
 
     def getServerIpPort(self, dcId):
         '''Get ip and port on which server is listening from config'''
-        return self.config['datacenters'][dcId][0], self.config['datacenters'][dcId][1]
+        return self.config['dc_addresses'][dcId][0], self.config['dc_addresses'][dcId][1]
 
 
     def formRequestMsg(self, tickets):
@@ -125,8 +127,8 @@ class RaftClient():
         '''Form the request message and send a tcp request to server asking for tickets'''
         if not self.leaderId:
             '''If leader is not known, randomly choose a server and request tickets'''
-            dcId =  random.randint(1, len(self.config['datacenters']))
-            dcId = 'dc'+str(dcId)
+            randomIdx =  random.randint(0, len(self.config['datacenters'])-1)
+            dcId = self.config['datacenters'][randomIdx]
         else:
             dcId = self.leaderId
 
@@ -160,8 +162,8 @@ class RaftClient():
         '''On timeout, choose a server that is not previous leader and send ticket request'''
         oldLeader = self.leaderId
         while True:
-            dcId =  random.randint(1, len(self.config['datacenters']))
-            dcId = 'dc'+str(dcId)
+            randomIdx =  random.randint(0, len(self.config['datacenters'])-1)
+            dcId = self.config['datacenters'][randomIdx]
             if dcId != oldLeader:
                 self.leaderId = dcId
                 break
@@ -196,8 +198,8 @@ class RaftClient():
     def sendConfigChangeCommand(self):
         if not self.leaderId:
             '''If leader is not known, randomly choose a server and request tickets'''
-            dcId =  random.randint(1, len(self.config['datacenters']))
-            dcId = 'dc'+str(dcId)
+            randomIdx =  random.randint(0, len(self.config['datacenters'])-1)
+            dcId = self.config['datacenters'][randomIdx]
         else:
             dcId = self.leaderId
 
