@@ -22,6 +22,8 @@ CONFIGFILE = 'config.json'
 
 PHASE1 = -1
 PHASE2 = -2
+YES = 'Yes'
+NO = 'No'
 
 STATES = {1: 'FOLLOWER', 2: 'CANDIDATE', 3: 'LEADER'}
 
@@ -35,6 +37,7 @@ class RaftServer():
         self.voteCount = 0
         self.replicatedIndexCount = {}
         self.logEntries = []
+        self.results = {}
         self.oldConfig = None
         self.newConfig = None
 
@@ -75,11 +78,13 @@ class RaftServer():
                 entry[0], entry[1], entry[2] = \
                 int(entry[0]), int(entry[1]), int(entry[2])
                 self.logEntries.append(entry)
+                '''Populate the mapping of requestId to its result from log'''
+                self.results[entry[3]] = entry[4]
 
         '''From lastLog, initialize lastLogIdx and lastLogTerm values'''
         lastLog = self.logEntries[-1] if self.logEntries else None
         if not lastLog:
-            lastLog = [-1, 0, None, None]
+            lastLog = [-1, 0, None, None, None]
     
         self.lastLogIdx = lastLog[0]
         self.lastLogTerm = lastLog[1]
@@ -390,7 +395,10 @@ class RaftServer():
                 self.checkAndCommitConfigChange(self.commitIdx)
                 '''Once an entry is commited, update ticket count and respond to client'''
                 self.executeClientRequest(self.commitIdx, respondToClient=True)
-                
+                '''Update the log entry for the committed index with executed as true'''
+                self.updateResult(self.commitIdx, res=YES)
+                self.writeLogEntriesToFile()
+
 
     def checkAndCommitConfigChange(self, commitIdx):
         cmd, reqId = self.getClientRequestFromLog(self.commitIdx)
@@ -467,6 +475,9 @@ class RaftServer():
             self.logger.debug('Updated commited index to %d' %self.commitIdx)
             '''Once an entry is commited, update ticket count and respond to client'''
             self.executeClientRequest(self.commitIdx)
+            '''Update the log entry for the committed index with executed as true'''
+            self.updateResult(self.commitIdx, res=YES)
+            self.writeLogEntriesToFile()
 
 
     def convertToFollower(self):
@@ -516,7 +527,14 @@ class RaftServer():
 
     def getNextLogEntry(self, command, reqId):
         '''Get the format of how new log entry should be'''
-        return [self.lastLogIdx, self.term, command, reqId]
+        return [self.lastLogIdx, self.term, command, reqId, NO]
+
+
+    def updateResult(self, logIdx, res=NO):
+        '''Update the result part of entry for the log at passed idx'''
+        self.logEntries[logIdx][4] = res
+        reqId = self.logEntries[logIdx][3]
+        self.results[reqId] = res
 
 
     def executeClientRequest(self, idx, respondToClient=False):
@@ -550,6 +568,22 @@ class RaftServer():
             response += logResp
         respMsg = self.formShowResponseMsg(respMsg=response)
         self.replyToClient(msg['reqId'], respMsg, display=False)
+
+
+    def isRequestExecuted(self, msgType, msg):
+        '''Check if the client request is already executed; if is it, just send
+        the appropriate response to client and return true; else return false'''
+        reqId = msg['reqId']
+        if reqId in self.results and self.results[reqId] == YES:
+            if msgType == CONFIGCHANGE:
+                response = 'Successfully changed configuration.'
+            else:
+                response = 'Successfully purchased %s tickets.' %msg['tickets']
+            respMsg = self.formClientResponseMsg(success=True, redirect=False, respMsg=response)
+            self.replyToClient(reqId, respMsg)
+            return True
+
+        return False
 
 
     ############################# Config change methods #############################
@@ -702,12 +736,14 @@ class RaftServer():
                 self.raft.handleAppendEntries(msg)
             elif msgType == CLIREQ:
                 cliReq = True
-                self.raft.handleClientRequest(recvMsg, msg)
+                if not self.raft.isRequestExecuted(msgType, msg):
+                    self.raft.handleClientRequest(recvMsg, msg)
             elif msgType == RESENTRIES and self.raft.state == STATES[3]:
                 '''Only leader should handle response entries'''
                 self.raft.handleResponseEntries(msg)
-            elif msgType == CONFIGCHANGE: 
-                self.raft.handleConfigChange(PHASE1, msg['reqId'])
+            elif msgType == CONFIGCHANGE:
+                if not self.raft.isRequestExecuted(msgType, msg):
+                    self.raft.handleConfigChange(PHASE1, msg['reqId'])
 
             if not cliReq:
                 conn.close() 
