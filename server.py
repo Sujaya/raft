@@ -432,8 +432,8 @@ class RaftServer():
                         self.updateCommitIdxOfFollower(msg['commitIdx'])
 
                     if len(msg['entries']) > 0:
-                        self.logger.debug('Updated (lastLogIdx, lastLogTerm, logEntries) to (%d, %d, %s)' \
-                        %(self.lastLogIdx, self.lastLogTerm, repr(self.logEntries)))
+                        self.logger.debug('Updated (lastLogIdx, lastLogTerm) to (%d, %d)' \
+                        %(self.lastLogIdx, self.lastLogTerm))
 
         if len(msg['entries']) > 0 or success==False:
             '''Respond only for msgs that are not heartbeats'''
@@ -516,21 +516,22 @@ class RaftServer():
 
 
     def handleShowCommand(self, msg):
-        response = 'Current log that is present on server %s is:\n' %(self.dcId)
+        response = '\nThe current number of avaliable tickets are: %d\n' %(self.tickets)
+        response += 'Current log that is present on server %s is:\n' %(self.dcId)
         
         for entry in self.logEntries:
             cmd = entry[2]
             if cmd == -1:
-                logResp = str(entry[0]) + ': Config change (old + new).\n'
+                logResp = '[' + str(entry[0]) + ']: Config change (old + new).\n'
             elif cmd == -2:
-                logResp = str(entry[0]) + ': Config change (new).\n'
+                logResp = '[' + str(entry[0]) + ']: Config change (new).\n'
             else:
                 clientId = entry[3].split(':')[0]
-                logResp = str(entry[0]) + ': Client %s bought %d tickets successfully.\n' %(clientId, cmd)
+                logResp = '[' + str(entry[0]) + ']: Client %s bought %d tickets successfully.\n' %(clientId, cmd)
 
             response += logResp
         respMsg = self.formShowResponseMsg(respMsg=response)
-        self.replyToClient(msg['reqId'], respMsg)
+        self.replyToClient(msg['reqId'], respMsg, display=False)
 
 
     ############################# Config change methods #############################
@@ -622,10 +623,10 @@ class RaftServer():
             pass
         
 
-    def replyToClient(self, reqId, respMsg):
+    def replyToClient(self, reqId, respMsg, display=True):
         clientId = reqId.split(':')[0]
-        ip, port = self.getClienrIpPort(clientId)
-        self.sendTcpMsg(ip, port, respMsg)
+        ip, port = self.getClientIpPort(clientId)
+        self.sendTcpMsg(ip, port, respMsg, display=display)
 
 
     def getServerIpPort(self, dcId):
@@ -633,7 +634,7 @@ class RaftServer():
         return self.config['datacenters'][dcId][0], self.config['datacenters'][dcId][1]
 
 
-    def getClienrIpPort(self, clId):
+    def getClientIpPort(self, clId):
         '''Get ip and port on which client is listening from config'''
         return self.config['clients'][clId][0], self.config['clients'][clId][1]
 
@@ -659,12 +660,18 @@ class RaftServer():
 
 
         def run(self): 
-            cliReq = False
+            cliReq, display = False, True
             conn, recvMsg = self.conn, self.conn.recv(2048)
             
-
             msgType, msg = self.parseRecvMsg(recvMsg)
-            if msgType != APPENDENTRIES and msgType != RESENTRIES:
+
+            if msgType == APPENDENTRIES and len(msg['entries']) == 0:
+                display = False
+
+            elif msgType == RESENTRIES and msg['success'] == True:
+                display = False
+
+            if display:
                 logMsg = 'Received message from: (%s:%d). Message is: %s' %(self.ip, self.port, recvMsg)
                 self.raft.logger.debug(logMsg)
 
