@@ -19,5 +19,5 @@
 
 	"election_timeout":[4,8],
 	"heartbeat_timeout":2,
-	"client_request_timeout": 10
+	"client_request_timeout": 8
 }

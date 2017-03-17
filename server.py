@@ -40,6 +40,7 @@ class RaftServer():
         self.results = {}
         self.oldConfig = None
         self.newConfig = None
+        self.commitLock = threading.Lock()
 
         self.initParam()
         self.resetElectionTimer()
@@ -355,7 +356,8 @@ class RaftServer():
         Decrement it's nextIdx and retry appendEntries RPC'''
         followerId = msg['followerId']
         if followerId in self.followers:
-            self.followers[followerId] -= 1
+            if self.followers[followerId] > 0:
+                self.followers[followerId] -= 1
             self.sendAppendEntriesMsg(followerId)
 
 
@@ -378,7 +380,7 @@ class RaftServer():
                     self.updateCommitIdx(nextIdx)
             nextIdx += 1
 
-        self.followers[followerId] = nextIdx   
+        self.followers[followerId] = nextIdx
 
 
     def updateCommitIdx(self, nextIdx):
@@ -388,17 +390,21 @@ class RaftServer():
         '''If the term of the entry is same as current leader's term, then mark all 
         entries till that entry as committed'''
         if logTerm == self.term:
-            while self.commitIdx < nextIdx:
-                self.commitIdx += 1
-                self.logger.debug('Updated commited index to %d' %self.commitIdx)
-                if self.commitIdx in self.replicatedIndexCount:
-                    self.replicatedIndexCount.pop(self.commitIdx)
-                self.checkAndCommitConfigChange(self.commitIdx)
-                '''Once an entry is commited, update ticket count and respond to client'''
-                self.executeClientRequest(self.commitIdx, respondToClient=True)
-                '''Update the log entry for the committed index with executed as true'''
-                self.updateResult(self.commitIdx, res=YES)
-                self.writeLogEntriesToFile()
+            self.commitLock.acquire()
+            try:
+                while self.commitIdx < nextIdx:
+                    self.commitIdx += 1
+                    self.logger.debug('Updated commited index to %d' %self.commitIdx)
+                    if self.commitIdx in self.replicatedIndexCount:
+                        self.replicatedIndexCount.pop(self.commitIdx)
+                    self.checkAndCommitConfigChange(self.commitIdx)
+                    '''Once an entry is commited, update ticket count and respond to client'''
+                    self.executeClientRequest(self.commitIdx, respondToClient=True)
+                    '''Update the log entry for the committed index with executed as true'''
+                    self.updateResult(self.commitIdx, res=YES)
+                    self.writeLogEntriesToFile()
+            finally:
+                self.commitLock.release()
 
 
     def checkAndCommitConfigChange(self, commitIdx):
@@ -472,14 +478,18 @@ class RaftServer():
 
     def updateCommitIdxOfFollower(self, newCommitIdx):
         '''Update commit idx and state machine of follower'''
-        while self.commitIdx < newCommitIdx:
-            self.commitIdx += 1
-            self.logger.debug('Updated commited index to %d' %self.commitIdx)
-            '''Once an entry is commited, update ticket count and respond to client'''
-            self.executeClientRequest(self.commitIdx)
-            '''Update the log entry for the committed index with executed as true'''
-            self.updateResult(self.commitIdx, res=YES)
-            self.writeLogEntriesToFile()
+        self.commitLock.acquire()
+        try:
+            while self.commitIdx < newCommitIdx:
+                self.commitIdx += 1
+                self.logger.debug('Updated commited index to %d' %self.commitIdx)
+                '''Once an entry is commited, update ticket count and respond to client'''
+                self.executeClientRequest(self.commitIdx)
+                '''Update the log entry for the committed index with executed as true'''
+                self.updateResult(self.commitIdx, res=YES)
+                self.writeLogEntriesToFile()
+        finally:
+            self.commitLock.release()
 
 
     def convertToFollower(self):
