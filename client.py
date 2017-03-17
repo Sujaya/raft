@@ -106,7 +106,6 @@ class RaftClient():
 
             '''Update leader id based on the server response'''
             self.leaderId = msg['leaderId']
-            print msg['response']
 
             if msgType == CLIRES:
                 '''If its response for ticket request, cancel timer and handle the message accordingly'''
@@ -116,9 +115,14 @@ class RaftClient():
                 else:
                     if self.lastReq == CONFIGCHANGE:
                         self.readAndApplyConfig()
+                    if self.leaderId:
+                        print '\nCurrent LEADER is %s.'%self.leaderId 
+                    print msg['response']
                     self.requestTicketsFromUser()
 
             else:
+                print '\nCurrent LEADER is %s.'%self.leaderId 
+                print msg['response']
                 '''If its response of show, continue prompting user'''
                 self.requestTicketsFromUser()
 
@@ -224,10 +228,14 @@ class RaftClient():
     def requestTicketsFromUser(self): 
         '''Take request from user and request tickets from server''' 
         while True:
-            displayMsg = "\nChoose an option:\na) Press 1 to buy tickets.\nb) Press 2 to show log on the server.\n"
-            displayMsg += "c) Press 3 initiate configuration change.\n"
-            choice = raw_input(displayMsg)
-            choice = int(choice)
+            try:
+                displayMsg = "\nChoose an option:\na) Press 1 to buy tickets.\nb) Press 2 to show log on the server.\n"
+                displayMsg += "c) Press 3 initiate configuration change.\n"
+                choice = raw_input(displayMsg)
+                choice = int(choice)
+            except:
+                continue
+
             if choice != 1 and choice != 2 and choice != 3:
                 print 'Invalid option! Please enter either 1 or 2.'
                 continue

@@ -293,7 +293,7 @@ class RaftServer():
 
 
     def convertToLeader(self):
-        self.logger.debug('Converting to leader.')
+        self.logger.debug('\nConverting to LEADER.\n')
         self.state = STATES[3]
         self.leaderId = self.dcId
         self.initFollowerDetails()
@@ -312,6 +312,21 @@ class RaftServer():
         self.heartbeatTimer.start()
 
 
+    def sendAppendEntriesToAll(self):
+        if self.state == STATES[3]:
+            for dcId in self.followers:
+                self.sendAppendEntriesMsg(dcId)
+            self.resetHeartbeatTimer()
+
+
+    def sendAppendEntriesMsg(self, dcId, display=True):
+        msg = self.formAppendEntriesMsg(self.followers[dcId])
+        ip, port = self.getServerIpPort(dcId)
+        #if len(msg['AppendEntries']['entries']) == 0:
+        display = False
+        self.sendTcpMsg(ip, port, msg, display=display)
+
+
     def initFollowerDetails(self):
         '''Initialize next index for every follower once the server becomes leader'''
         for dcId in self.config['datacenters']:
@@ -320,20 +335,6 @@ class RaftServer():
             if dcId not in self.followers:
                 '''Initialize nextIdx for each follower as leader's lastIdx+1.'''
                 self.followers[dcId] = self.lastLogIdx + 1
-
-
-    def sendAppendEntriesToAll(self):
-        for dcId in self.followers:
-            self.sendAppendEntriesMsg(dcId)
-        self.resetHeartbeatTimer()
-
-
-    def sendAppendEntriesMsg(self, dcId, display=True):
-        msg = self.formAppendEntriesMsg(self.followers[dcId])
-        ip, port = self.getServerIpPort(dcId)
-        if len(msg['AppendEntries']['entries']) == 0:
-            display = False
-        self.sendTcpMsg(ip, port, msg, display=display)
 
 
     def handleResponseEntries(self, msg):
@@ -449,13 +450,14 @@ class RaftServer():
                     if len(msg['entries']) > 0:
                         self.lastLogIdx = len(self.logEntries)-1
                         self.lastLogTerm = self.logEntries[self.lastLogIdx][1]
+                        self.logger.debug('\nAppending new entries %s to local log.'%repr(msg['entries']))
                         self.checkForConfigChange(msg['entries'])
                     success = True
                     if msg['commitIdx'] > self.commitIdx:
                         self.updateCommitIdxOfFollower(msg['commitIdx'])
 
                     if len(msg['entries']) > 0:
-                        self.logger.debug('Updated (lastLogIdx, lastLogTerm) to (%d, %d)' \
+                        self.logger.debug('Updated (lastLogIdx, lastLogTerm) to (%d, %d)\n' \
                         %(self.lastLogIdx, self.lastLogTerm))
 
         if len(msg['entries']) > 0 or success==False:
@@ -513,6 +515,7 @@ class RaftServer():
                 self.lastLogTerm = self.term
                 entry = self.getNextLogEntry(msg['tickets'], msg['reqId'])
                 self.logEntries.append(entry)
+                self.results[msg['reqId']] = NO
                 '''Initialize count for this index as 1 in replicatedIndexCount variable'''
                 self.replicatedIndexCount[self.lastLogIdx] = 1
                 self.sendAppendEntriesToAll()
@@ -553,7 +556,7 @@ class RaftServer():
 
     def handleShowCommand(self, msg):
         response = '\nThe current number of avaliable tickets are: %d\n' %(self.tickets)
-        response += 'Current log that is present on server %s is:\n' %(self.dcId)
+        response += 'Current log present on server %s is:\n' %(self.dcId)
         
         for entry in self.logEntries:
             cmd = entry[2]
@@ -574,13 +577,16 @@ class RaftServer():
         '''Check if the client request is already executed; if is it, just send
         the appropriate response to client and return true; else return false'''
         reqId = msg['reqId']
-        if reqId in self.results and self.results[reqId] == YES:
-            if msgType == CONFIGCHANGE:
-                response = 'Successfully changed configuration.'
-            else:
-                response = 'Successfully purchased %s tickets.' %msg['tickets']
-            respMsg = self.formClientResponseMsg(success=True, redirect=False, respMsg=response)
-            self.replyToClient(reqId, respMsg)
+        if reqId in self.results:
+            '''If the request was already taken, don't do anything with it'''
+            if self.results[reqId] == YES:
+                '''If the command was already executed, send success message to client'''
+                if msgType == CONFIGCHANGE:
+                    response = 'Successfully changed configuration.'
+                else:
+                    response = 'Successfully purchased %s tickets.' %msg['tickets']
+                respMsg = self.formClientResponseMsg(success=True, redirect=False, respMsg=response)
+                self.replyToClient(reqId, respMsg)
             return True
 
         return False
@@ -710,12 +716,12 @@ class RaftServer():
 
 
         def run(self): 
-            cliReq, display = False, True
+            display = True
             conn, recvMsg = self.conn, self.conn.recv(2048)
             
             msgType, msg = self.parseRecvMsg(recvMsg)
 
-            if msgType == APPENDENTRIES and len(msg['entries']) == 0:
+            if msgType == APPENDENTRIES:
                 display = False
 
             elif msgType == RESENTRIES and msg['success'] == True:
@@ -726,7 +732,6 @@ class RaftServer():
                 self.raft.logger.debug(logMsg)
     
             if msgType == SHOWREQ:
-                cliReq = True
                 self.raft.handleShowCommand(msg)
             elif msgType == REQVOTE:
                 self.raft.handleVoteRequest(msg)
@@ -734,19 +739,17 @@ class RaftServer():
                 self.raft.handleVoteReply(msg)
             elif msgType == APPENDENTRIES:
                 self.raft.handleAppendEntries(msg)
-            elif msgType == CLIREQ:
-                cliReq = True
-                if not self.raft.isRequestExecuted(msgType, msg):
-                    self.raft.handleClientRequest(recvMsg, msg)
             elif msgType == RESENTRIES and self.raft.state == STATES[3]:
                 '''Only leader should handle response entries'''
                 self.raft.handleResponseEntries(msg)
+            elif msgType == CLIREQ:
+                if not self.raft.isRequestExecuted(msgType, msg):
+                    self.raft.handleClientRequest(recvMsg, msg)
             elif msgType == CONFIGCHANGE:
                 if not self.raft.isRequestExecuted(msgType, msg):
                     self.raft.handleConfigChange(PHASE1, msg['reqId'])
 
-            if not cliReq:
-                conn.close() 
+            conn.close() 
             sys.exit()
 
 
