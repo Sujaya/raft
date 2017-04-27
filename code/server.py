@@ -41,6 +41,7 @@ class RaftServer():
         self.oldConfig = None
         self.newConfig = None
         self.commitLock = threading.Lock()
+        self.stateChangeLock = threading.Lock()
 
         self.initParam()
         self.resetElectionTimer()
@@ -286,8 +287,13 @@ class RaftServer():
         leader else update term and convert to follower.'''
         if msg['voteGranted'] == True:
             self.voteCount += 1
-            if self.voteCount >= self.majority and self.state != STATES[3]:
-                self.convertToLeader()
+            self.stateChangeLock.acquire()
+            try:
+                if self.voteCount >= self.majority and self.state != STATES[3]:
+                    self.convertToLeader()
+            finally:
+                self.stateChangeLock.release()
+
         elif msg['term'] > self.term:
             self.term = msg['term']
             self.convertToFollower()
@@ -402,6 +408,7 @@ class RaftServer():
                     self.executeClientRequest(self.commitIdx, respondToClient=True)
                     '''Update the log entry for the committed index with executed as true'''
                     self.updateResult(self.commitIdx, res=YES)
+                    self.writeStateToFile()
                     self.writeLogEntriesToFile()
             finally:
                 self.commitLock.release()
@@ -420,6 +427,7 @@ class RaftServer():
 
             if self.dcId not in self.config['datacenters']:
                 self.sendAppendEntriesToAll()
+                time.sleep(2)
                 '''If current server is leader and it is not in new config, make it a follower'''
                 self.convertToFollower()
                 self.leaderId = None
@@ -487,6 +495,7 @@ class RaftServer():
                 self.executeClientRequest(self.commitIdx)
                 '''Update the log entry for the committed index with executed as true'''
                 self.updateResult(self.commitIdx, res=YES)
+                self.writeStateToFile()
                 self.writeLogEntriesToFile()
         finally:
             self.commitLock.release()

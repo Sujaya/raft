@@ -1,5 +1,5 @@
 {
-	"datacenters": ["dc1", "dc2", "dc3"],
+	"datacenters": [ "dc3", "dc4", "dc5"],
 
 	"clients": {
 		"cl1": ["127.0.0.1", 6001],
